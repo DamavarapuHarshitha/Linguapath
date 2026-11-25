@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, F
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3, hashlib, secrets, hmac, base64, json, time, os, urllib.request, urllib.error, tempfile
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -125,7 +126,22 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS progress(
             user_id INTEGER NOT NULL, lesson_id TEXT NOT NULL,
             completed INTEGER NOT NULL DEFAULT 0,
+            xp INTEGER NOT NULL DEFAULT 0,
+            hearts INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(user_id, lesson_id),
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS stats(
+            user_id INTEGER PRIMARY KEY,
+            xp INTEGER NOT NULL DEFAULT 0,
+            hearts INTEGER NOT NULL DEFAULT 5,
+            streak INTEGER NOT NULL DEFAULT 0,
+            last_active TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS achievements(
+            user_id INTEGER NOT NULL,
+            achievement_id TEXT NOT NULL,
+            earned_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(user_id, achievement_id),
             FOREIGN KEY(user_id) REFERENCES users(id))""")
 
 @app.on_event("startup")
@@ -292,6 +308,7 @@ def register(body: RegisterIn):
         with conn() as c:
             cur = c.execute("INSERT INTO users(name,email,password_hash,salt) VALUES(?,?,?,?)",(name,email,ph,salt))
             uid = cur.lastrowid
+            c.execute("INSERT INTO stats(user_id,xp,hearts,streak,last_active) VALUES(?,0,5,0,?)",(uid,date.today().isoformat()))
     except sqlite3.IntegrityError:
         raise HTTPException(409, "An account with this email already exists.")
     return {"token":make_token(uid),"user":{"id":uid,"name":name,"email":email}}
@@ -302,6 +319,8 @@ def login(body: LoginIn):
         user = c.execute("SELECT * FROM users WHERE email=?", (body.email.strip().lower(),)).fetchone()
     if not user or not hmac.compare_digest(hash_password(body.password, user["salt"]), user["password_hash"]):
         raise HTTPException(401, "Incorrect email or password.")
+    with conn() as c:
+        c.execute("INSERT OR IGNORE INTO stats(user_id,xp,hearts,streak,last_active) VALUES(?,0,5,0,?)",(user["id"],date.today().isoformat()))
     return {"token":make_token(user["id"]),"user":{"id":user["id"],"name":user["name"],"email":user["email"]}}
 
 @app.get("/api/me")
@@ -357,3 +376,71 @@ def get_progress(user=Depends(current_user)):
     completed = [r["lesson_id"] for r in rows]
     total = sum(len(u["lessons"]) for co in COURSES for u in co["units"])
     return {"completed_lessons":completed,"completed_count":len(completed),"total_lessons":total}
+
+@app.get("/api/stats")
+def get_stats(user=Depends(current_user)):
+    with conn() as c:
+        stats = c.execute("SELECT * FROM stats WHERE user_id=?", (user["id"],)).fetchone()
+    if not stats:
+        raise HTTPException(404, "Stats not found.")
+    return {"xp":stats["xp"], "hearts":stats["hearts"], "streak":stats["streak"], "last_active":stats["last_active"]}
+
+@app.post("/api/stats/xp")
+def add_xp(amount: int, user=Depends(current_user)):
+    if amount <= 0:
+        raise HTTPException(400, "XP amount must be positive.")
+    with conn() as c:
+        c.execute("INSERT INTO stats(user_id, xp) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET xp = xp + ?", (user["id"], amount, amount))
+    return {"message":f"Added {amount} XP."}
+
+@app.post("/api/stats/hearts")
+def update_hearts(amount: int, user=Depends(current_user)):
+    with conn() as c:
+        current_hearts = c.execute("SELECT hearts FROM stats WHERE user_id=?", (user["id"],)).fetchone()
+        if not current_hearts:
+            raise HTTPException(404, "Stats not found.")
+        new_hearts = current_hearts["hearts"] + amount
+        if new_hearts < 0:
+            raise HTTPException(400, "Hearts cannot be negative.")
+        c.execute("UPDATE stats SET hearts=? WHERE user_id=?", (new_hearts, user["id"]))
+    return {"message":f"Updated hearts. New balance: {new_hearts}."}
+
+@app.post("/api/stats/streak")
+def update_streak(days: int, user=Depends(current_user)):
+    if days < 0:
+        raise HTTPException(400, "Streak days cannot be negative.")
+    with conn() as c:
+        c.execute("INSERT INTO stats(user_id, streak) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET streak = ?", (user["id"], days, days))
+    return {"message":f"Updated streak to {days} days."}
+
+@app.post("/api/achievements")
+def unlock_achievement(achievement_id: str, user=Depends(current_user)):
+    with conn() as c:
+        c.execute("INSERT INTO achievements(user_id, achievement_id) VALUES(?, ?) ON CONFLICT(user_id, achievement_id) DO NOTHING", (user["id"], achievement_id))
+
+class GamifiedCompleteIn(BaseModel):
+    lesson_id: str
+    xp: int = 10
+
+@app.post("/api/activity/complete")
+def complete_activity(body: GamifiedCompleteIn, user=Depends(current_user)):
+    valid = any(l["id"] == body.lesson_id for co in COURSES for un in co["units"] for l in un["lessons"])
+    if not valid:
+        raise HTTPException(404, "Lesson not found.")
+    today = date.today()
+    with conn() as c:
+        c.execute("INSERT INTO progress(user_id,lesson_id,completed) VALUES(?,?,1) ON CONFLICT(user_id,lesson_id) DO UPDATE SET completed=1",(user["id"],body.lesson_id))
+        c.execute("INSERT OR IGNORE INTO stats(user_id,xp,hearts,streak,last_active) VALUES(?,0,5,0,?)",(user["id"],today.isoformat()))
+        row = c.execute("SELECT xp,hearts,streak,last_active FROM stats WHERE user_id=?",(user["id"],)).fetchone()
+        streak = row["streak"]
+        last_active = date.fromisoformat(row["last_active"]) if row["last_active"] else None
+        if last_active != today:
+            streak = streak + 1 if last_active == today - timedelta(days=1) else 1
+        xp = row["xp"] + max(1, min(body.xp, 100))
+        c.execute("UPDATE stats SET xp=?,hearts=5,streak=?,last_active=? WHERE user_id=?",(xp,streak,today.isoformat(),user["id"]))
+        achievements=[]
+        if xp >= 100:
+            c.execute("INSERT OR IGNORE INTO achievements(user_id,achievement_id) VALUES(?,?)",(user["id"],"xp-100")); achievements.append("xp-100")
+        if streak >= 7:
+            c.execute("INSERT OR IGNORE INTO achievements(user_id,achievement_id) VALUES(?,?)",(user["id"],"week-streak")); achievements.append("week-streak")
+    return {"completed":True,"xp":xp,"hearts":5,"streak":streak,"achievements":achievements}
